@@ -18,7 +18,9 @@ load_dotenv()
 GMAIL_CLIENT_ID = os.environ["GMAIL_CLIENT_ID"]
 GMAIL_CLIENT_SECRET = os.environ["GMAIL_CLIENT_SECRET"]
 GMAIL_REFRESH_TOKEN = os.environ["GMAIL_REFRESH_TOKEN"]
-SENDER_EMAIL_FILTER = os.environ["SENDER_EMAIL_FILTER"]
+# Optional: if set, only forward mail From this address. Leave empty to forward
+# all new inbox mail in the authorized feedback mailbox.
+SENDER_EMAIL_FILTER = os.environ.get("SENDER_EMAIL_FILTER", "").strip()
 GREEN_API_ID_INSTANCE = os.environ["GREEN_API_ID_INSTANCE"].strip()
 GREEN_API_TOKEN = os.environ["GREEN_API_TOKEN"].strip()
 WHATSAPP_CHAT_ID = os.environ["WHATSAPP_CHAT_ID"].strip()
@@ -69,7 +71,13 @@ def get_or_create_label(service):
 
 
 def find_new_emails(service):
-    q = f"from:{SENDER_EMAIL_FILTER} -label:{DEDUP_LABEL} newer_than:2d"
+    # Reads the authorized Gmail inbox (feedback mailbox used for OAuth).
+    
+    parts = [f"-label:{DEDUP_LABEL}", "newer_than:2d", "in:inbox"]
+    if SENDER_EMAIL_FILTER:
+        parts.insert(0, f"from:{SENDER_EMAIL_FILTER}")
+    q = " ".join(parts)
+    print(f"Gmail search: {q}")
     result = (
         service.users()
         .messages()
@@ -243,6 +251,13 @@ def main():
     print("Starting email-to-whatsapp forwarding run...")
 
     service = get_gmail_service()
+    profile = service.users().getProfile(userId="me").execute()
+    print(f"Monitoring inbox: {profile.get('emailAddress')}")
+    if SENDER_EMAIL_FILTER:
+        print(f"Sender filter (optional): {SENDER_EMAIL_FILTER}")
+    else:
+        print("Sender filter: (none) — forwarding all new inbox mail")
+
     label_id = get_or_create_label(service)
     messages = find_new_emails(service)
 
@@ -272,14 +287,14 @@ def main():
                         caption=att["filename"],
                     )
                     att_ok += 1
-                    time.sleep(2)  # avoid Green API rate limits between media sends
+                    time.sleep(2) 
                 except Exception as att_err:
                     print(
                         f'  ✗ Attachment failed ({att["filename"]}): {att_err}',
                         file=sys.stderr,
                     )
 
-            # Label after text succeeds so retries don't spam duplicate text.
+            
             # Attachment failures are reported but do not block labeling.
             label_email(service, msg["id"], label_id)
             sent += 1
@@ -288,7 +303,7 @@ def main():
                 f'(attachments {att_ok}/{len(attachments)})'
             )
         except Exception as err:
-            # Don't label if text send failed — retry next run
+            
             print(f'✗ Failed to forward message {msg["id"]}: {err}', file=sys.stderr)
 
     print(f"Done. Forwarded {sent}/{len(messages)} emails.")
