@@ -1,6 +1,6 @@
 # Email → WhatsApp Forwarder
 
-Forwards feedback emails received in a Gmail mailbox to WhatsApp via [Green API](https://green-api.com), scheduled through GitHub Actions (twice daily + manual trigger).
+Forwards feedback emails received in a Gmail mailbox to WhatsApp via [Green API](https://green-api.com), scheduled through GitHub Actions (**12:00 PM and 12:00 AM Pakistan time** + manual trigger).
 
 **Stack:** Python 3.12, `google-api-python-client` (Gmail API), `requests` (Green API), `python-dotenv`, GitHub Actions cron.
 
@@ -27,15 +27,13 @@ These are **two different choices** and they do **not** have to be the same Goog
    That **must** be the feedback mailbox (the inbox that receives user emails).
 
 3. **Common correct setup**  
-   - Create GCP project with company account  
+   - Create GCP project with  account  A. 
    - Create OAuth client in that project  
    - In OAuth Playground, authorize while logged into the **feedback mailbox**  
    - If app is in Testing mode, add the feedback mailbox as a Test user first  
 
-4. **Common mistake**  
-   Creating GCP + authorizing with your personal Gmail → script monitors your personal inbox, not the feedback mailbox.
 
-5. **How to verify**  
+4. **How to verify**  
    After setup, run the script and check the log line `Monitoring inbox: ...` — it must show the feedback mailbox.
 
 ## Setup Order

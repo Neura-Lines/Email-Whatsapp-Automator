@@ -5,9 +5,9 @@ name: Forward Emails to WhatsApp
 
 on:
   schedule:
-    # Runs at 09:00 and 21:00 UTC daily — adjust to your timezone
-    - cron: "0 9 * * *"
-    - cron: "0 21 * * *"
+    # Pakistan time (UTC+5): 12:00 PM and 12:00 AM
+    - cron: "0 7 * * *"   # 12:00 PM PKT
+    - cron: "0 19 * * *"  # 12:00 AM PKT
   workflow_dispatch: # Manual trigger for testing
 
 jobs:
