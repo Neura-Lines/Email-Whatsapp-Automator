@@ -31,4 +31,5 @@ jobs:
           GREEN_API_ID_INSTANCE: ${{ secrets.GREEN_API_ID_INSTANCE }}
           GREEN_API_TOKEN: ${{ secrets.GREEN_API_TOKEN }}
           GREEN_API_URL: ${{ secrets.GREEN_API_URL }}
+          GREEN_API_MEDIA_URL: ${{ secrets.GREEN_API_MEDIA_URL }}
           WHATSAPP_CHAT_ID: ${{ secrets.WHATSAPP_CHAT_ID }}

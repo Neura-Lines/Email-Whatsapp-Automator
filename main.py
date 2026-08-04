@@ -2,7 +2,10 @@ import os
 import sys
 import base64
 import re
+import time
 from html import unescape
+from io import BytesIO
+from typing import Optional
 
 from dotenv import load_dotenv
 from google.oauth2.credentials import Credentials
@@ -24,8 +27,14 @@ GREEN_API_URL = (
     os.environ.get("GREEN_API_URL", "").strip().rstrip("/")
     or f"https://{GREEN_API_ID_INSTANCE[:4]}.api.greenapi.com"
 )
+GREEN_API_MEDIA_URL = (
+    os.environ.get("GREEN_API_MEDIA_URL", "").strip().rstrip("/")
+    or "https://media.green-api.com"
+)
 
 MAX_EMAILS_PER_RUN = 5
+MAX_ATTACHMENTS_PER_EMAIL = 5
+MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20 MB
 DEDUP_LABEL = "Forwarded-WA"
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 
@@ -83,6 +92,12 @@ def _extract_body(parts_or_payload) -> str:
     def walk(part):
         nonlocal plain, html
         mime = part.get("mimeType", "")
+        filename = part.get("filename") or ""
+        # Skip attachment parts when collecting body text
+        if filename:
+            for sub in part.get("parts", []):
+                walk(sub)
+            return
         data = part.get("body", {}).get("data")
         if data:
             decoded = base64.urlsafe_b64decode(data).decode("utf-8", errors="replace")
@@ -97,6 +112,53 @@ def _extract_body(parts_or_payload) -> str:
     return plain if plain else strip_html(html) if html else ""
 
 
+def _collect_attachment_parts(payload) -> list:
+    """Collect MIME parts that look like file attachments (have a filename)."""
+    found = []
+
+    def walk(part):
+        filename = (part.get("filename") or "").strip()
+        body = part.get("body", {})
+        if filename and (body.get("attachmentId") or body.get("data")):
+            found.append(part)
+        for sub in part.get("parts", []):
+            walk(sub)
+
+    walk(payload)
+    return found
+
+
+def _download_attachment(service, msg_id: str, part: dict) -> Optional[dict]:
+    filename = part.get("filename") or "attachment"
+    mime = part.get("mimeType") or "application/octet-stream"
+    body = part.get("body", {})
+    size = int(body.get("size") or 0)
+
+    if size and size > MAX_ATTACHMENT_BYTES:
+        print(f'  ⚠ Skipping oversized attachment "{filename}" ({size} bytes)')
+        return None
+
+    if body.get("data"):
+        data = base64.urlsafe_b64decode(body["data"])
+    elif body.get("attachmentId"):
+        att = (
+            service.users()
+            .messages()
+            .attachments()
+            .get(userId="me", messageId=msg_id, id=body["attachmentId"])
+            .execute()
+        )
+        data = base64.urlsafe_b64decode(att["data"])
+    else:
+        return None
+
+    if len(data) > MAX_ATTACHMENT_BYTES:
+        print(f'  ⚠ Skipping oversized attachment "{filename}" ({len(data)} bytes)')
+        return None
+
+    return {"filename": filename, "mimeType": mime, "data": data}
+
+
 def get_email_content(service, msg_id: str) -> dict:
     msg = (
         service.users()
@@ -107,11 +169,18 @@ def get_email_content(service, msg_id: str) -> dict:
     headers = {h["name"].lower(): h["value"] for h in msg["payload"]["headers"]}
     body = _extract_body(msg["payload"])
 
+    attachments = []
+    for part in _collect_attachment_parts(msg["payload"])[:MAX_ATTACHMENTS_PER_EMAIL]:
+        downloaded = _download_attachment(service, msg_id, part)
+        if downloaded:
+            attachments.append(downloaded)
+
     return {
         "from": headers.get("from", ""),
         "subject": headers.get("subject", ""),
         "date": headers.get("date", ""),
         "body": body[:3000],
+        "attachments": attachments,
     }
 
 
@@ -133,7 +202,28 @@ def send_whatsapp(chat_id: str, message: str):
     return resp.json()
 
 
+def send_whatsapp_file(chat_id: str, filename: str, data: bytes, caption: str = ""):
+    url = (
+        f"{GREEN_API_MEDIA_URL}"
+        f"/waInstance{GREEN_API_ID_INSTANCE}"
+        f"/sendFileByUpload/{GREEN_API_TOKEN}"
+    )
+    files = {"file": (filename, BytesIO(data))}
+    form = {"chatId": chat_id, "fileName": filename}
+    if caption:
+        form["caption"] = caption
+
+    resp = requests.post(url, data=form, files=files, timeout=120)
+    resp.raise_for_status()
+    return resp.json()
+
+
 def format_message(email: dict) -> str:
+    attachment_note = ""
+    if email.get("attachments"):
+        names = ", ".join(a["filename"] for a in email["attachments"])
+        attachment_note = f"\n\n📎 *Attachments:* {names}"
+
     return (
         "📧 *Email Forwarded*\n"
         "\n"
@@ -144,6 +234,7 @@ def format_message(email: dict) -> str:
         "───── Body ─────\n"
         "\n"
         f"{email['body'] or '(empty)'}"
+        f"{attachment_note}"
     )
 
 
@@ -167,14 +258,40 @@ def main():
             email = get_email_content(service, msg["id"])
             text = format_message(email)
             send_whatsapp(WHATSAPP_CHAT_ID, text)
+            print(f'  ✓ Text sent: "{email["subject"]}"')
+
+            att_ok = 0
+            attachments = email.get("attachments", [])
+            for att in attachments:
+                try:
+                    print(f'  → Sending attachment: {att["filename"]}')
+                    send_whatsapp_file(
+                        WHATSAPP_CHAT_ID,
+                        att["filename"],
+                        att["data"],
+                        caption=att["filename"],
+                    )
+                    att_ok += 1
+                    time.sleep(2)  # avoid Green API rate limits between media sends
+                except Exception as att_err:
+                    print(
+                        f'  ✗ Attachment failed ({att["filename"]}): {att_err}',
+                        file=sys.stderr,
+                    )
+
+            # Label after text succeeds so retries don't spam duplicate text.
+            # Attachment failures are reported but do not block labeling.
             label_email(service, msg["id"], label_id)
             sent += 1
-            print(f'✓ Forwarded: "{email["subject"]}"')
+            print(
+                f'✓ Done: "{email["subject"]}" '
+                f'(attachments {att_ok}/{len(attachments)})'
+            )
         except Exception as err:
-            # Don't label on failure — retries next run
+            # Don't label if text send failed — retry next run
             print(f'✗ Failed to forward message {msg["id"]}: {err}', file=sys.stderr)
 
-    print(f"Done. Sent {sent}/{len(messages)} emails.")
+    print(f"Done. Forwarded {sent}/{len(messages)} emails.")
 
 
 if __name__ == "__main__":
