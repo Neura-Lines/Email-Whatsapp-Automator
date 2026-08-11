@@ -1,30 +1,33 @@
 import os
 import sys
-import base64
 import re
 import time
+import imaplib
+import email
+from datetime import datetime, timedelta, timezone
+from email.header import decode_header, make_header
 from html import unescape
 from io import BytesIO
 from typing import Optional
 
 from dotenv import load_dotenv
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
 import requests
 
 load_dotenv()
 
 # ─── Config ─────────────────────────────────────────────────────────────────
-GMAIL_CLIENT_ID = os.environ["GMAIL_CLIENT_ID"]
-GMAIL_CLIENT_SECRET = os.environ["GMAIL_CLIENT_SECRET"]
-GMAIL_REFRESH_TOKEN = os.environ["GMAIL_REFRESH_TOKEN"]
+EMAIL_ADDRESS = os.environ["EMAIL_ADDRESS"].strip()
+EMAIL_PASSWORD = os.environ["EMAIL_PASSWORD"].strip()
+EMAIL_IMAP_HOST = os.environ.get("EMAIL_IMAP_HOST", "imap.titan.email").strip()
+EMAIL_IMAP_PORT = int(os.environ.get("EMAIL_IMAP_PORT", "993"))
+
 # Optional: if set, only forward mail From this address. Leave empty to forward
-# all new inbox mail in the authorized feedback mailbox.
+# all new inbox mail in the feedback mailbox.
 SENDER_EMAIL_FILTER = os.environ.get("SENDER_EMAIL_FILTER", "").strip()
+
 GREEN_API_ID_INSTANCE = os.environ["GREEN_API_ID_INSTANCE"].strip()
 GREEN_API_TOKEN = os.environ["GREEN_API_TOKEN"].strip()
 WHATSAPP_CHAT_ID = os.environ["WHATSAPP_CHAT_ID"].strip()
-# Dashboard shows the exact host (e.g. https://7107.api.greenapi.com). Fallback: first 4 digits of instance id.
 GREEN_API_URL = (
     os.environ.get("GREEN_API_URL", "").strip().rstrip("/")
     or f"https://{GREEN_API_ID_INSTANCE[:4]}.api.greenapi.com"
@@ -37,54 +40,18 @@ GREEN_API_MEDIA_URL = (
 MAX_EMAILS_PER_RUN = 5
 MAX_ATTACHMENTS_PER_EMAIL = 5
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20 MB
-DEDUP_LABEL = "Forwarded-WA"
-TOKEN_URI = "https://oauth2.googleapis.com/token"
+# After a successful text send, message is moved here so it won't be resent.
+DEDUP_FOLDER = "Forwarded-WA"
 
 
-# ─── Gmail auth ─────────────────────────────────────────────────────────────
-def get_gmail_service():
-    creds = Credentials(
-        token=None,
-        refresh_token=GMAIL_REFRESH_TOKEN,
-        client_id=GMAIL_CLIENT_ID,
-        client_secret=GMAIL_CLIENT_SECRET,
-        token_uri=TOKEN_URI,
-    )
-    return build("gmail", "v1", credentials=creds)
-
-
-# ─── Gmail helpers ──────────────────────────────────────────────────────────
-def get_or_create_label(service):
-    results = service.users().labels().list(userId="me").execute()
-    for label in results.get("labels", []):
-        if label["name"] == DEDUP_LABEL:
-            return label["id"]
-
-    body = {
-        "name": DEDUP_LABEL,
-        "labelListVisibility": "labelShow",
-        "messageListVisibility": "show",
-    }
-    created = service.users().labels().create(userId="me", body=body).execute()
-    print(f'Created Gmail label "{DEDUP_LABEL}"')
-    return created["id"]
-
-
-def find_new_emails(service):
-    # Reads the authorized Gmail inbox (feedback mailbox used for OAuth).
-    
-    parts = [f"-label:{DEDUP_LABEL}", "newer_than:2d", "in:inbox"]
-    if SENDER_EMAIL_FILTER:
-        parts.insert(0, f"from:{SENDER_EMAIL_FILTER}")
-    q = " ".join(parts)
-    print(f"Gmail search: {q}")
-    result = (
-        service.users()
-        .messages()
-        .list(userId="me", q=q, maxResults=MAX_EMAILS_PER_RUN)
-        .execute()
-    )
-    return result.get("messages", [])
+# ─── Helpers ────────────────────────────────────────────────────────────────
+def decode_mime_header(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    try:
+        return str(make_header(decode_header(value)))
+    except Exception:
+        return value
 
 
 def strip_html(html: str) -> str:
@@ -93,109 +60,142 @@ def strip_html(html: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _extract_body(parts_or_payload) -> str:
-    """Recursively extract text/plain (preferred) or text/html from MIME parts."""
+def get_body(msg: email.message.Message) -> str:
     plain, html = "", ""
-
-    def walk(part):
-        nonlocal plain, html
-        mime = part.get("mimeType", "")
-        filename = part.get("filename") or ""
-        # Skip attachment parts when collecting body text
-        if filename:
-            for sub in part.get("parts", []):
-                walk(sub)
-            return
-        data = part.get("body", {}).get("data")
-        if data:
-            decoded = base64.urlsafe_b64decode(data).decode("utf-8", errors="replace")
-            if mime == "text/plain":
-                plain += decoded
-            elif mime == "text/html":
-                html += decoded
-        for sub in part.get("parts", []):
-            walk(sub)
-
-    walk(parts_or_payload)
-    return plain if plain else strip_html(html) if html else ""
-
-
-def _collect_attachment_parts(payload) -> list:
-    """Collect MIME parts that look like file attachments (have a filename)."""
-    found = []
-
-    def walk(part):
-        filename = (part.get("filename") or "").strip()
-        body = part.get("body", {})
-        if filename and (body.get("attachmentId") or body.get("data")):
-            found.append(part)
-        for sub in part.get("parts", []):
-            walk(sub)
-
-    walk(payload)
-    return found
-
-
-def _download_attachment(service, msg_id: str, part: dict) -> Optional[dict]:
-    filename = part.get("filename") or "attachment"
-    mime = part.get("mimeType") or "application/octet-stream"
-    body = part.get("body", {})
-    size = int(body.get("size") or 0)
-
-    if size and size > MAX_ATTACHMENT_BYTES:
-        print(f'  ⚠ Skipping oversized attachment "{filename}" ({size} bytes)')
-        return None
-
-    if body.get("data"):
-        data = base64.urlsafe_b64decode(body["data"])
-    elif body.get("attachmentId"):
-        att = (
-            service.users()
-            .messages()
-            .attachments()
-            .get(userId="me", messageId=msg_id, id=body["attachmentId"])
-            .execute()
-        )
-        data = base64.urlsafe_b64decode(att["data"])
+    if msg.is_multipart():
+        for part in msg.walk():
+            disposition = (part.get_content_disposition() or "").lower()
+            if disposition == "attachment":
+                continue
+            filename = part.get_filename()
+            if filename:
+                continue
+            ctype = part.get_content_type()
+            try:
+                payload = part.get_payload(decode=True) or b""
+                charset = part.get_content_charset() or "utf-8"
+                text = payload.decode(charset, errors="replace")
+            except Exception:
+                continue
+            if ctype == "text/plain":
+                plain += text
+            elif ctype == "text/html":
+                html += text
     else:
-        return None
+        try:
+            payload = msg.get_payload(decode=True) or b""
+            charset = msg.get_content_charset() or "utf-8"
+            text = payload.decode(charset, errors="replace")
+            if msg.get_content_type() == "text/html":
+                html = text
+            else:
+                plain = text
+        except Exception:
+            pass
+    return (plain if plain else strip_html(html) if html else "")[:3000]
 
-    if len(data) > MAX_ATTACHMENT_BYTES:
-        print(f'  ⚠ Skipping oversized attachment "{filename}" ({len(data)} bytes)')
-        return None
 
-    return {"filename": filename, "mimeType": mime, "data": data}
-
-
-def get_email_content(service, msg_id: str) -> dict:
-    msg = (
-        service.users()
-        .messages()
-        .get(userId="me", id=msg_id, format="full")
-        .execute()
-    )
-    headers = {h["name"].lower(): h["value"] for h in msg["payload"]["headers"]}
-    body = _extract_body(msg["payload"])
-
+def get_attachments(msg: email.message.Message) -> list:
     attachments = []
-    for part in _collect_attachment_parts(msg["payload"])[:MAX_ATTACHMENTS_PER_EMAIL]:
-        downloaded = _download_attachment(service, msg_id, part)
-        if downloaded:
-            attachments.append(downloaded)
+    for part in msg.walk():
+        filename = part.get_filename()
+        disposition = (part.get_content_disposition() or "").lower()
+        if not filename and disposition != "attachment":
+            continue
+        filename = decode_mime_header(filename) or "attachment"
+        try:
+            data = part.get_payload(decode=True) or b""
+        except Exception:
+            continue
+        if not data:
+            continue
+        if len(data) > MAX_ATTACHMENT_BYTES:
+            print(f'  ⚠ Skipping oversized attachment "{filename}" ({len(data)} bytes)')
+            continue
+        attachments.append(
+            {
+                "filename": filename,
+                "mimeType": part.get_content_type() or "application/octet-stream",
+                "data": data,
+            }
+        )
+        if len(attachments) >= MAX_ATTACHMENTS_PER_EMAIL:
+            break
+    return attachments
 
+
+def parse_email(raw_bytes: bytes) -> dict:
+    msg = email.message_from_bytes(raw_bytes)
     return {
-        "from": headers.get("from", ""),
-        "subject": headers.get("subject", ""),
-        "date": headers.get("date", ""),
-        "body": body[:3000],
-        "attachments": attachments,
+        "from": decode_mime_header(msg.get("From")),
+        "subject": decode_mime_header(msg.get("Subject")),
+        "date": decode_mime_header(msg.get("Date")),
+        "body": get_body(msg),
+        "attachments": get_attachments(msg),
     }
 
 
-def label_email(service, msg_id: str, label_id: str):
-    service.users().messages().modify(
-        userId="me", id=msg_id, body={"addLabelIds": [label_id]}
-    ).execute()
+# ─── IMAP ───────────────────────────────────────────────────────────────────
+def connect_imap() -> imaplib.IMAP4_SSL:
+    imap = imaplib.IMAP4_SSL(EMAIL_IMAP_HOST, EMAIL_IMAP_PORT)
+    imap.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+    return imap
+
+
+def ensure_dedup_folder(imap: imaplib.IMAP4_SSL):
+    typ, folders = imap.list()
+    if typ == "OK" and folders:
+        for item in folders:
+            line = item.decode(errors="replace") if isinstance(item, bytes) else str(item)
+            if DEDUP_FOLDER in line:
+                return
+    typ, _ = imap.create(DEDUP_FOLDER)
+    if typ == "OK":
+        print(f'Created IMAP folder "{DEDUP_FOLDER}"')
+    else:
+        # Folder may already exist under a different listing format
+        print(f'Note: create "{DEDUP_FOLDER}" returned {typ}')
+
+
+def find_new_uids(imap: imaplib.IMAP4_SSL) -> list:
+    typ, _ = imap.select("INBOX")
+    if typ != "OK":
+        raise RuntimeError("Could not select INBOX")
+
+    since = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%d-%b-%Y")
+    if SENDER_EMAIL_FILTER:
+        criteria = f'(FROM "{SENDER_EMAIL_FILTER}" SINCE {since})'
+    else:
+        criteria = f"(SINCE {since})"
+
+    print(f"IMAP search: {criteria}")
+    typ, data = imap.uid("SEARCH", None, criteria)
+    if typ != "OK" or not data or not data[0]:
+        return []
+
+    uids = data[0].split()
+    # Newest first, then cap
+    uids = list(reversed(uids))[:MAX_EMAILS_PER_RUN]
+    return uids
+
+
+def fetch_email(imap: imaplib.IMAP4_SSL, uid: bytes) -> dict:
+    typ, data = imap.uid("FETCH", uid, "(RFC822)")
+    if typ != "OK" or not data or not data[0]:
+        raise RuntimeError(f"Failed to fetch UID {uid!r}")
+    raw = data[0][1]
+    if not isinstance(raw, (bytes, bytearray)):
+        raise RuntimeError(f"Unexpected fetch payload for UID {uid!r}")
+    return parse_email(bytes(raw))
+
+
+def mark_forwarded(imap: imaplib.IMAP4_SSL, uid: bytes):
+    """Move message to Forwarded-WA so the next run won't pick it again."""
+    typ, _ = imap.uid("COPY", uid, DEDUP_FOLDER)
+    if typ != "OK":
+        raise RuntimeError(f"Failed to copy UID {uid!r} to {DEDUP_FOLDER}")
+    imap.uid("STORE", uid, "+FLAGS", r"(\Deleted)")
+    imap.expunge()
 
 
 # ─── Green API ──────────────────────────────────────────────────────────────
@@ -226,87 +226,91 @@ def send_whatsapp_file(chat_id: str, filename: str, data: bytes, caption: str = 
     return resp.json()
 
 
-def format_message(email: dict) -> str:
+def format_message(parsed: dict) -> str:
     attachment_note = ""
-    if email.get("attachments"):
-        names = ", ".join(a["filename"] for a in email["attachments"])
+    if parsed.get("attachments"):
+        names = ", ".join(a["filename"] for a in parsed["attachments"])
         attachment_note = f"\n\n📎 *Attachments:* {names}"
 
     return (
         "📧 *Email Forwarded*\n"
         "\n"
-        f"*From:* {email['from']}\n"
-        f"*Date:* {email['date']}\n"
-        f"*Subject:* {email['subject']}\n"
+        f"*From:* {parsed['from']}\n"
+        f"*Date:* {parsed['date']}\n"
+        f"*Subject:* {parsed['subject']}\n"
         "\n"
         "───── Body ─────\n"
         "\n"
-        f"{email['body'] or '(empty)'}"
+        f"{parsed['body'] or '(empty)'}"
         f"{attachment_note}"
     )
 
 
 # ─── Main ───────────────────────────────────────────────────────────────────
 def main():
-    print("Starting email-to-whatsapp forwarding run...")
-
-    service = get_gmail_service()
-    profile = service.users().getProfile(userId="me").execute()
-    print(f"Monitoring inbox: {profile.get('emailAddress')}")
+    print("Starting email-to-whatsapp forwarding run (IMAP / Titan)...")
+    print(f"Monitoring inbox: {EMAIL_ADDRESS}")
+    print(f"IMAP: {EMAIL_IMAP_HOST}:{EMAIL_IMAP_PORT}")
     if SENDER_EMAIL_FILTER:
         print(f"Sender filter (optional): {SENDER_EMAIL_FILTER}")
     else:
         print("Sender filter: (none) — forwarding all new inbox mail")
 
-    label_id = get_or_create_label(service)
-    messages = find_new_emails(service)
+    imap = connect_imap()
+    try:
+        ensure_dedup_folder(imap)
+        uids = find_new_uids(imap)
 
-    if not messages:
-        print("No new emails found. Done.")
-        return
+        if not uids:
+            print("No new emails found. Done.")
+            return
 
-    print(f"Found {len(messages)} new email(s) to forward.")
+        print(f"Found {len(uids)} new email(s) to forward.")
 
-    sent = 0
-    for msg in messages:
+        sent = 0
+        for uid in uids:
+            uid_str = uid.decode() if isinstance(uid, bytes) else str(uid)
+            try:
+                parsed = fetch_email(imap, uid)
+                text = format_message(parsed)
+                send_whatsapp(WHATSAPP_CHAT_ID, text)
+                print(f'  ✓ Text sent: "{parsed["subject"]}"')
+
+                att_ok = 0
+                attachments = parsed.get("attachments", [])
+                for att in attachments:
+                    try:
+                        print(f'  → Sending attachment: {att["filename"]}')
+                        send_whatsapp_file(
+                            WHATSAPP_CHAT_ID,
+                            att["filename"],
+                            att["data"],
+                            caption=att["filename"],
+                        )
+                        att_ok += 1
+                        time.sleep(2)
+                    except Exception as att_err:
+                        print(
+                            f'  ✗ Attachment failed ({att["filename"]}): {att_err}',
+                            file=sys.stderr,
+                        )
+
+                # Move out of INBOX only after text succeeded (retry-safe for text).
+                mark_forwarded(imap, uid)
+                sent += 1
+                print(
+                    f'✓ Done: "{parsed["subject"]}" '
+                    f"(attachments {att_ok}/{len(attachments)})"
+                )
+            except Exception as err:
+                print(f"✗ Failed to forward UID {uid_str}: {err}", file=sys.stderr)
+
+        print(f"Done. Forwarded {sent}/{len(uids)} emails.")
+    finally:
         try:
-            email = get_email_content(service, msg["id"])
-            text = format_message(email)
-            send_whatsapp(WHATSAPP_CHAT_ID, text)
-            print(f'  ✓ Text sent: "{email["subject"]}"')
-
-            att_ok = 0
-            attachments = email.get("attachments", [])
-            for att in attachments:
-                try:
-                    print(f'  → Sending attachment: {att["filename"]}')
-                    send_whatsapp_file(
-                        WHATSAPP_CHAT_ID,
-                        att["filename"],
-                        att["data"],
-                        caption=att["filename"],
-                    )
-                    att_ok += 1
-                    time.sleep(2) 
-                except Exception as att_err:
-                    print(
-                        f'  ✗ Attachment failed ({att["filename"]}): {att_err}',
-                        file=sys.stderr,
-                    )
-
-            
-            # Attachment failures are reported but do not block labeling.
-            label_email(service, msg["id"], label_id)
-            sent += 1
-            print(
-                f'✓ Done: "{email["subject"]}" '
-                f'(attachments {att_ok}/{len(attachments)})'
-            )
-        except Exception as err:
-            
-            print(f'✗ Failed to forward message {msg["id"]}: {err}', file=sys.stderr)
-
-    print(f"Done. Forwarded {sent}/{len(messages)} emails.")
+            imap.logout()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
