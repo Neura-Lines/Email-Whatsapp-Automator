@@ -37,7 +37,8 @@ GREEN_API_MEDIA_URL = (
     or "https://media.green-api.com"
 )
 
-MAX_EMAILS_PER_RUN = 5
+MAX_EMAILS_PER_RUN = int(os.environ.get("MAX_EMAILS_PER_RUN", "5"))
+LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "2"))
 MAX_ATTACHMENTS_PER_EMAIL = 5
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20 MB
 # After a successful text send, message is moved here so it won't be resent.
@@ -110,7 +111,7 @@ def get_attachments(msg: email.message.Message) -> list:
         if not data:
             continue
         if len(data) > MAX_ATTACHMENT_BYTES:
-            print(f'  ⚠ Skipping oversized attachment "{filename}" ({len(data)} bytes)')
+            print(f'  Skipping oversized attachment "{filename}" ({len(data)} bytes)')
             continue
         attachments.append(
             {
@@ -162,11 +163,14 @@ def find_new_uids(imap: imaplib.IMAP4_SSL) -> list:
     if typ != "OK":
         raise RuntimeError("Could not select INBOX")
 
-    since = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%d-%b-%Y")
-    if SENDER_EMAIL_FILTER:
-        criteria = f'(FROM "{SENDER_EMAIL_FILTER}" SINCE {since})'
+    if LOOKBACK_DAYS > 0:
+        since = (datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)).strftime("%d-%b-%Y")
+        if SENDER_EMAIL_FILTER:
+            criteria = f'(FROM "{SENDER_EMAIL_FILTER}" SINCE {since})'
+        else:
+            criteria = f"(SINCE {since})"
     else:
-        criteria = f"(SINCE {since})"
+        criteria = f'(FROM "{SENDER_EMAIL_FILTER}")' if SENDER_EMAIL_FILTER else "ALL"
 
     print(f"IMAP search: {criteria}")
     typ, data = imap.uid("SEARCH", None, criteria)
@@ -254,7 +258,10 @@ def main():
     if SENDER_EMAIL_FILTER:
         print(f"Sender filter (optional): {SENDER_EMAIL_FILTER}")
     else:
-        print("Sender filter: (none) — forwarding all new inbox mail")
+            print("Sender filter: (none) — forwarding all new inbox mail")
+    print(f"Max emails this run: {MAX_EMAILS_PER_RUN}")
+    print(f"Lookback days: {LOOKBACK_DAYS if LOOKBACK_DAYS > 0 else 'all'}")
+    print(f"WhatsApp target: {WHATSAPP_CHAT_ID}")
 
     imap = connect_imap()
     try:
@@ -274,7 +281,7 @@ def main():
                 parsed = fetch_email(imap, uid)
                 text = format_message(parsed)
                 send_whatsapp(WHATSAPP_CHAT_ID, text)
-                print(f'  ✓ Text sent: "{parsed["subject"]}"')
+                print(f'  Text sent: "{parsed["subject"]}"')
 
                 att_ok = 0
                 attachments = parsed.get("attachments", [])
@@ -291,7 +298,7 @@ def main():
                         time.sleep(2)
                     except Exception as att_err:
                         print(
-                            f'  ✗ Attachment failed ({att["filename"]}): {att_err}',
+                            f'  Attachment failed ({att["filename"]}): {att_err}',
                             file=sys.stderr,
                         )
 
@@ -299,11 +306,11 @@ def main():
                 mark_forwarded(imap, uid)
                 sent += 1
                 print(
-                    f'✓ Done: "{parsed["subject"]}" '
+                    f'Done: "{parsed["subject"]}" '
                     f"(attachments {att_ok}/{len(attachments)})"
                 )
             except Exception as err:
-                print(f"✗ Failed to forward UID {uid_str}: {err}", file=sys.stderr)
+                print(f"Failed to forward UID {uid_str}: {err}", file=sys.stderr)
 
         print(f"Done. Forwarded {sent}/{len(uids)} emails.")
     finally:
