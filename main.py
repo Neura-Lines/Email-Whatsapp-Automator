@@ -2,6 +2,7 @@ import os
 import sys
 import re
 import time
+import hashlib
 import imaplib
 import email
 from datetime import datetime, timedelta, timezone
@@ -36,6 +37,11 @@ GREEN_API_MEDIA_URL = (
     os.environ.get("GREEN_API_MEDIA_URL", "").strip().rstrip("/")
     or "https://media.green-api.com"
 )
+
+# Optional: create a support_tickets row in shamela-backend before marking
+# Forwarded-WA. When unset, WhatsApp forwarding behaves as before.
+TICKETS_API_URL = os.environ.get("TICKETS_API_URL", "").strip().rstrip("/")
+TICKETS_API_SECRET = os.environ.get("TICKETS_API_SECRET", "").strip()
 
 MAX_EMAILS_PER_RUN = int(os.environ.get("MAX_EMAILS_PER_RUN", "5"))
 LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "2"))
@@ -127,7 +133,18 @@ def get_attachments(msg: email.message.Message) -> list:
 
 def parse_email(raw_bytes: bytes) -> dict:
     msg = email.message_from_bytes(raw_bytes)
+    message_id = (msg.get("Message-ID") or msg.get("Message-Id") or "").strip()
+    if not message_id:
+        # Stable across process restarts (unlike Python's randomized hash()).
+        subject = decode_mime_header(msg.get("Subject"))
+        date = decode_mime_header(msg.get("Date"))
+        from_addr = decode_mime_header(msg.get("From"))
+        digest = hashlib.sha256(
+            f"{from_addr}\n{subject}\n{date}".encode("utf-8", errors="replace")
+        ).hexdigest()[:32]
+        message_id = f"generated:{digest}"
     return {
+        "message_id": message_id,
         "from": decode_mime_header(msg.get("From")),
         "subject": decode_mime_header(msg.get("Subject")),
         "date": decode_mime_header(msg.get("Date")),
@@ -230,6 +247,36 @@ def send_whatsapp_file(chat_id: str, filename: str, data: bytes, caption: str = 
     return resp.json()
 
 
+def create_support_ticket(parsed: dict) -> None:
+    """POST ticket to shamela-backend. No-op if TICKETS_API_URL unset."""
+    if not TICKETS_API_URL:
+        return
+    if not TICKETS_API_SECRET:
+        raise RuntimeError("TICKETS_API_URL set but TICKETS_API_SECRET is empty")
+
+    url = f"{TICKETS_API_URL}/api/internal/support-tickets"
+    payload = {
+        "message_id": parsed["message_id"],
+        "subject": parsed.get("subject") or "",
+        "body": parsed.get("body") or "",
+        "from_address": parsed.get("from") or "",
+    }
+    resp = requests.post(
+        url,
+        json=payload,
+        headers={
+            "Content-Type": "application/json",
+            "X-Internal-Secret": TICKETS_API_SECRET,
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    created = data.get("created")
+    ticket_id = (data.get("ticket") or {}).get("id")
+    print(f'  Ticket {"created" if created else "exists/merged"}: {ticket_id}')
+
+
 def format_message(parsed: dict) -> str:
     attachment_note = ""
     if parsed.get("attachments"):
@@ -262,6 +309,10 @@ def main():
     print(f"Max emails this run: {MAX_EMAILS_PER_RUN}")
     print(f"Lookback days: {LOOKBACK_DAYS if LOOKBACK_DAYS > 0 else 'all'}")
     print(f"WhatsApp target: {WHATSAPP_CHAT_ID}")
+    if TICKETS_API_URL:
+        print(f"Tickets API: {TICKETS_API_URL}")
+    else:
+        print("Tickets API: (disabled) — set TICKETS_API_URL to create support tickets")
 
     imap = connect_imap()
     try:
@@ -279,6 +330,11 @@ def main():
             uid_str = uid.decode() if isinstance(uid, bytes) else str(uid)
             try:
                 parsed = fetch_email(imap, uid)
+                # Ticket before WhatsApp when enabled. Failure leaves mail in
+                # INBOX (no Forwarded-WA) so the next run retries. Unset
+                # TICKETS_API_URL to keep WhatsApp-only behavior.
+                create_support_ticket(parsed)
+
                 text = format_message(parsed)
                 send_whatsapp(WHATSAPP_CHAT_ID, text)
                 print(f'  Text sent: "{parsed["subject"]}"')
@@ -302,7 +358,7 @@ def main():
                             file=sys.stderr,
                         )
 
-                # Move out of INBOX only after text succeeded (retry-safe for text).
+                # Move out of INBOX only after text (+ ticket) succeeded.
                 mark_forwarded(imap, uid)
                 sent += 1
                 print(
