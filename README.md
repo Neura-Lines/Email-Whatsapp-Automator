@@ -1,6 +1,6 @@
 # Email → WhatsApp Forwarder (Titan IMAP)
 
-Forwards feedback emails from a **Titan Email** inbox to WhatsApp via [Green API](https://green-api.com), scheduled through GitHub Actions (**12:00 PM and 12:00 AM Pakistan time** + manual trigger).
+Forwards feedback emails from a **Titan Email** inbox to WhatsApp via [Green API](https://green-api.com), scheduled through GitHub Actions (**09:00, 15:00, and 21:00 Pakistan time** + manual trigger). Optionally creates a `support_tickets` row on shamela-backend before moving the message.
 
 **Stack:** Python 3.12, IMAP (`imaplib`), `requests` (Green API), `python-dotenv`, GitHub Actions cron.
 
@@ -62,6 +62,8 @@ On start, the script prints `Monitoring inbox: ...` — confirm it shows the Tit
    - `GREEN_API_URL` (optional)
    - `GREEN_API_MEDIA_URL` (optional)
    - `WHATSAPP_CHAT_ID` — individual: `923001234567@c.us` | group: `120363012345678901@g.us`
+   - `TICKETS_API_URL` (optional) — e.g. `https://shamelagpt.com`
+   - `TICKETS_API_SECRET` (optional) — must match backend `INTERNAL_TICKETS_SECRET`
 
 Remove any old Gmail OAuth secrets (`GMAIL_*`) if they were added earlier — they are unused now.
 
@@ -75,8 +77,9 @@ Remove any old Gmail OAuth secrets (`GMAIL_*`) if they were added earlier — th
 
 - Connects to Titan over IMAP SSL and searches INBOX for messages from the last **2 days** (max **5** per run).
 - Optional `FROM` filter if `SENDER_EMAIL_FILTER` is set.
+- If `TICKETS_API_URL` is set, POSTs a support ticket to shamela-backend **before** WhatsApp send. Ticket create failure leaves the mail in INBOX for retry.
 - Sends email text + attachments to WhatsApp via Green API.
-- After a successful text send, moves the message to an IMAP folder named `Forwarded-WA` (created automatically) so it won’t be forwarded again.
+- After a successful text send (and ticket create when enabled), moves the message to an IMAP folder named `Forwarded-WA` (created automatically) so it won’t be forwarded again.
 
 ## Known Limitations
 
